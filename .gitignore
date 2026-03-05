@@ -1,0 +1,6 @@
+# compiled binary
+schwab-cli
+
+# credentials and tokens (never commit these)
+*.credentials
+token.json
