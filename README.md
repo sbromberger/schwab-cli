@@ -6,7 +6,7 @@ A command-line tool for viewing Charles Schwab account balances and positions, w
 
 - A [Charles Schwab developer account](https://developer.schwab.com) with an app registered for the Trader API
 - Go 1.21 or later (for building from source)
-- The redirect URI for your app must be set to `https://127.0.0.1`
+- The redirect URI for your app must be set to `https://127.0.0.1` (this is what the tool expects)
 
 ## Installation
 
@@ -98,9 +98,26 @@ Below the accounts, an aggregated positions section lists all holdings across al
 
 ## Security
 
-- The credentials file is checked for `0600` permissions and correct ownership before any secrets are read.
-- OAuth tokens are stored in `token.json` (also written as `0600`) in the config directory.
-- Token writes are atomic (written to a temp file, then renamed).
+### Authentication model
+
+schwab-cli uses the [OAuth 2.0 Authorization Code flow](https://developer.schwab.com/products/trader-api--individual/details/documentation/Retail%20Trader%20API%20Production). No password is ever handled by this tool. The flow works as follows:
+
+1. `schwab-cli login` constructs an authorization URL containing your app key and the redirect URI, and prints it to the terminal.
+2. You open that URL in a browser, log in to Schwab, and approve access. Schwab redirects your browser to the redirect URI with an authorization code appended as a query parameter. Copy the full URL from the browser's address bar.
+3. Paste that redirect URL into the terminal. schwab-cli extracts the authorization code and exchanges it for an access token and a refresh token via a direct HTTPS call to Schwab's token endpoint.
+4. The tokens are saved locally. On subsequent runs, the access token is used directly; when it expires (after 30 minutes), the refresh token is used to obtain a new one automatically. If the refresh token expires (after 7 days), you run `schwab-cli login` again.
+
+At no point does schwab-cli act as a server, open a listening port, or transmit your credentials anywhere other than directly to `api.schwabapi.com`.
+
+### Credential and token storage
+
+- **Credentials file** (`APP_KEY`, `SECRET`): Before reading, the tool checks that the file is owned by the current user and has exactly `0600` permissions. It exits with an error if either check fails — this prevents secrets from being readable by other users or processes.
+- **Token file** (`token.json`): Written with `0600` permissions. Writes are atomic — the token is first written to a temporary file in the same directory, then renamed into place, so a crash mid-write can never produce a corrupted or partially written token file.
+- **Config directory**: `~/.config/schwab-cli/` — entirely local, never synced or transmitted.
+
+### What the API token can do
+
+The Schwab Trader API token grants read access to account balances and positions, and the ability to place trades if your app is configured for it. schwab-cli only uses read endpoints. The token cannot be used to transfer funds, change account settings, or access personal information beyond what is shown in the tool's output.
 
 ## Dependencies
 
