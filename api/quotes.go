@@ -28,6 +28,13 @@ type quoteResponse struct {
 		QuoteTime        int64   `json:"quoteTime"`  // Unix milliseconds; equities
 		TradeTime        int64   `json:"tradeTime"`  // Unix milliseconds; mutual funds
 	} `json:"quote"`
+	// Regular is populated for equities/ETFs and contains the official
+	// regular-market close price and change, unaffected by after-hours trading.
+	Regular struct {
+		LastPrice  float64 `json:"regularMarketLastPrice"`
+		NetChange  float64 `json:"regularMarketNetChange"`
+		NetPctChange float64 `json:"regularMarketPercentChange"`
+	} `json:"regular"`
 }
 
 // indexDefs defines the indices we display, in order.
@@ -70,10 +77,22 @@ func GetSymbolQuotes(accessToken string, symbols []string) (map[string]SymbolQuo
 		if qt == 0 {
 			qt = q.Quote.TradeTime
 		}
+		// Prefer regular-market fields (official close) over quote fields,
+		// which may reflect after-hours activity for equities/ETFs.
+		// Mutual funds and indices have no regular block so they fall back
+		// to the quote fields.
+		lastPrice := q.Regular.LastPrice
+		netChange := q.Regular.NetChange
+		netChangePct := q.Regular.NetPctChange
+		if lastPrice == 0 {
+			lastPrice = q.Quote.LastPrice
+			netChange = q.Quote.NetChange
+			netChangePct = q.Quote.NetPercentChange
+		}
 		result[sym] = SymbolQuote{
-			LastPrice:    q.Quote.LastPrice,
-			NetChange:    q.Quote.NetChange,
-			NetChangePct: q.Quote.NetPercentChange,
+			LastPrice:    lastPrice,
+			NetChange:    netChange,
+			NetChangePct: netChangePct,
 			QuoteTime:    qt,
 			Description:  q.Description,
 		}
