@@ -40,6 +40,11 @@ var printer = message.NewPrinter(language.AmericanEnglish)
 // If forceColor is true, ANSI color codes are emitted even when stdout is not a TTY.
 // If interval > 0, the display refreshes every interval seconds until interrupted.
 func Balances(cfg *config.Config, configDir string, jsonOut bool, forceColor bool, interval int) {
+	// descCache persists across interval ticks; each symbol is looked up at most once.
+	descCache := make(map[string]string)
+	// mktHours caches today's equity market hours; re-fetched when the date changes.
+	var mktHours api.MarketHours
+
 	if interval > 0 {
 		// Hide cursor for the duration of the loop; always restore on exit.
 		fmt.Print(ansiHideCursor)
@@ -61,7 +66,8 @@ func Balances(cfg *config.Config, configDir string, jsonOut bool, forceColor boo
 				first = false
 			}
 			fmt.Print(ansiHome)
-			fetchAndPrint(cfg, configDir, jsonOut, forceColor)
+			mktHours = refreshMarketHours(cfg, configDir, mktHours)
+			fetchAndPrint(cfg, configDir, jsonOut, forceColor, descCache, mktHours)
 			fmt.Print(ansiEraseToEnd)
 			fmt.Printf("\n%sUpdated: %s — refreshing every %ds  (Ctrl-C to quit)%s\n",
 				ansiDim, time.Now().Format("15:04:05"), interval, ansiReset)
@@ -73,11 +79,36 @@ func Balances(cfg *config.Config, configDir string, jsonOut bool, forceColor boo
 			}
 		}
 	}
-	fetchAndPrint(cfg, configDir, jsonOut, forceColor)
+	mktHours = refreshMarketHours(cfg, configDir, mktHours)
+	fetchAndPrint(cfg, configDir, jsonOut, forceColor, descCache, mktHours)
+}
+
+// refreshMarketHours returns a fresh MarketHours if the cached value is for a
+// different calendar date (or was never fetched). On error it returns the
+// previous cached value so the display degrades gracefully.
+func refreshMarketHours(cfg *config.Config, configDir string, cached api.MarketHours) api.MarketHours {
+	today := time.Now().Format("2006-01-02")
+	if cached.Date == today {
+		return cached
+	}
+	token, err := auth.LoadToken(configDir)
+	if err != nil {
+		return cached
+	}
+	token, err = auth.EnsureFresh(cfg, token, configDir)
+	if err != nil {
+		return cached
+	}
+	h, err := api.GetEquityMarketHours(token.AccessToken)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not fetch market hours: %v\n", err)
+		return cached
+	}
+	return h
 }
 
 // fetchAndPrint performs one fetch+display cycle.
-func fetchAndPrint(cfg *config.Config, configDir string, jsonOut bool, forceColor bool) {
+func fetchAndPrint(cfg *config.Config, configDir string, jsonOut bool, forceColor bool, descCache map[string]string, mktHours api.MarketHours) {
 	token, err := auth.LoadToken(configDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -107,11 +138,61 @@ func fetchAndPrint(cfg *config.Config, configDir string, jsonOut bool, forceColo
 
 	indices, err := api.GetIndexQuotes(token.AccessToken)
 	if err != nil {
-		// Non-fatal: display table without the index line.
 		fmt.Fprintf(os.Stderr, "warning: could not fetch index quotes: %v\n", err)
 	}
 
-	printTable(accounts, cfg.Accounts, indices, forceColor)
+	// Collect unique position symbols for the quotes call.
+	symbolSet := make(map[string]struct{})
+	for _, a := range accounts {
+		for _, p := range a.SecuritiesAccount.Positions {
+			symbolSet[p.Instrument.Symbol] = struct{}{}
+		}
+	}
+	posSymbols := make([]string, 0, len(symbolSet))
+	for sym := range symbolSet {
+		posSymbols = append(posSymbols, sym)
+	}
+	symbolQuotes, err := api.GetSymbolQuotes(token.AccessToken, posSymbols)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not fetch position quotes: %v\n", err)
+		symbolQuotes = nil
+	}
+
+	// For symbols with no description from the quotes call, look them up via
+	// the instruments endpoint. Results are cached so each symbol is queried once.
+	var needDesc []string
+	for sym, q := range symbolQuotes {
+		if q.Description == "" {
+			if _, cached := descCache[sym]; !cached {
+				needDesc = append(needDesc, sym)
+			}
+		}
+	}
+	if len(needDesc) > 0 {
+		descs, err := api.GetInstrumentDescriptions(token.AccessToken, needDesc)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not fetch instrument descriptions: %v\n", err)
+		}
+		for sym, desc := range descs {
+			descCache[sym] = desc
+		}
+		// Mark looked-up symbols even when no description was found, so we
+		// don't re-query them on the next tick.
+		for _, sym := range needDesc {
+			if _, ok := descCache[sym]; !ok {
+				descCache[sym] = ""
+			}
+		}
+	}
+	// Merge cached descriptions into symbolQuotes.
+	for sym, desc := range descCache {
+		if q, ok := symbolQuotes[sym]; ok && q.Description == "" && desc != "" {
+			q.Description = desc
+			symbolQuotes[sym] = q
+		}
+	}
+
+	printTable(accounts, cfg.Accounts, indices, symbolQuotes, forceColor, mktHours)
 }
 
 // printJSON pretty-prints the raw API response.
@@ -131,15 +212,29 @@ func printJSON(raw []byte) {
 
 // aggPosition accumulates position data across accounts for a single symbol.
 type aggPosition struct {
-	symbol      string
-	description string
-	quantity    float64
-	marketValue float64
-	dayPL       float64 // sum of currentDayProfitLoss across accounts
+	symbol         string
+	description    string
+	marketValue    float64
+	currentPrice   float64 // from quotes API
+	priceChange    float64 // per-share daily $ change from quotes API
+	priceChangePct float64 // per-share daily % change from quotes API
+	stale          bool    // true if the quote is from a previous calendar day
+}
+
+// isToday returns true if the Unix millisecond timestamp falls on today's local date.
+func isToday(unixMs int64) bool {
+	if unixMs == 0 {
+		return false
+	}
+	t := time.UnixMilli(unixMs)
+	now := time.Now()
+	y1, m1, d1 := t.Date()
+	y2, m2, d2 := now.Date()
+	return y1 == y2 && m1 == m2 && d1 == d2
 }
 
 // printTable renders the account balance table followed by an aggregated positions section.
-func printTable(accounts []api.Account, accountEntries map[string]config.AccountEntry, indices []api.IndexQuote, forceColor bool) {
+func printTable(accounts []api.Account, accountEntries map[string]config.AccountEntry, indices []api.IndexQuote, symbolQuotes map[string]api.SymbolQuote, forceColor bool, mktHours api.MarketHours) {
 	isTTY := forceColor || term.IsTerminal(int(os.Stdout.Fd()))
 
 	hasConfig := len(accountEntries) > 0
@@ -163,19 +258,19 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 	// Column headers for the account summary section.
 	hAccount := accountHeader
 	hLiqVal := "VALUE"
-	hDayChange := "∆day ($)"
-	hDayPct := "∆day (%)"
+	hDayChange := " ∆day$"
+	hDayPct := " ∆day%"
 
 	// Column headers for the positions section.
-	hSymbol := "SYMBOL"
-	hDesc := "DESCRIPTION"
-	hQty := "QTY"
-	hMktVal := "MKT VALUE"
-	hPosDayChg := "∆day ($)"
-	hPosDayPct := "∆day (%)"
+	hSymbol  := "SYMBOL"
+	hName    := "NAME"
+	hPrice   := "PRICE"
+	hChgD    := hDayChange
+	hChgP    := hDayPct
+	hMktVal  := "MKT VALUE"
 
 	rows := make([]accountRow, 0, len(accounts))
-	var totalCurLiq, totalIniLiq float64
+	var totalCurLiq, totalIniLiq, totalChangeDollar float64
 
 	// aggMap accumulates positions keyed by symbol.
 	aggMap := make(map[string]*aggPosition)
@@ -199,14 +294,20 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 			}
 		}
 
-		dayChangeDollar := cur.LiquidationValue - ini.LiquidationValue
+		var dayChangeDollar float64
+		if ini.LiquidationValue != 0 {
+			dayChangeDollar = cur.LiquidationValue - ini.LiquidationValue
+		}
 		var dayChangePct float64
 		if ini.LiquidationValue != 0 {
 			dayChangePct = (dayChangeDollar / ini.LiquidationValue) * 100
 		}
 
 		totalCurLiq += cur.LiquidationValue
-		totalIniLiq += ini.LiquidationValue
+		if ini.LiquidationValue != 0 {
+			totalIniLiq += ini.LiquidationValue
+			totalChangeDollar += dayChangeDollar
+		}
 
 		rows = append(rows, accountRow{
 			account:   display,
@@ -228,9 +329,20 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 				}
 				aggSymbols = append(aggSymbols, sym)
 			}
-			aggMap[sym].quantity += p.Quantity
 			aggMap[sym].marketValue += p.MarketValue
-			aggMap[sym].dayPL += p.CurrentDayPL
+		}
+	}
+
+	// Populate quote data for each aggregated position.
+	for sym, ap := range aggMap {
+		if q, ok := symbolQuotes[sym]; ok {
+			ap.currentPrice   = q.LastPrice
+			ap.priceChange    = q.NetChange
+			ap.priceChangePct = q.NetChangePct
+			ap.stale          = !isToday(q.QuoteTime) && mktHours.HasOpenedToday()
+			if ap.description == "" {
+				ap.description = q.Description
+			}
 		}
 	}
 
@@ -243,7 +355,6 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 	sort.Strings(aggSymbols)
 
 	// Build total row.
-	totalChangeDollar := totalCurLiq - totalIniLiq
 	var totalChangePct float64
 	if totalIniLiq != 0 {
 		totalChangePct = (totalChangeDollar / totalIniLiq) * 100
@@ -252,8 +363,8 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 	// ── Compute account section column widths ──────────────────────────────
 	w0 := len(hAccount)
 	w1 := len(hLiqVal)
-	w2 := len(hDayChange)
-	w3 := len(hDayPct)
+	w2 := visLen(hDayChange)
+	w3 := visLen(hDayPct)
 
 	totalLiqStr := formatDollar(totalCurLiq)
 	totalChgStr := formatChangeDollar(totalChangeDollar)
@@ -280,49 +391,65 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 		}
 	}
 
-	sepLen := w0 + 4 + w1 + 4 + w2 + 4 + w3
+	sepLen    := w0 + 4 + w1 + 4 + w2 + 4 + w3
 
 	// ── Compute aggregated position section column widths ──────────────────
 	pw0 := len(hSymbol)
-	pw1 := len(hDesc)
-	pw2 := len(hQty)
-	pw3 := len(hMktVal)
-	pw4 := len(hPosDayChg)
-	pw5 := len(hPosDayPct)
+	pw1 := len(hName)
+	pw2 := len(hPrice)
+	pw3 := len(hChgD)
+	pw4 := len(hChgP)
+	pw5 := len(hMktVal)
 
 	for _, sym := range aggSymbols {
 		ap := aggMap[sym]
-		// dayPct for aggregate: dayPL / (marketValue - dayPL) * 100
-		// (marketValue - dayPL) approximates the opening market value.
-		var apDayPct float64
-		openVal := ap.marketValue - ap.dayPL
-		if openVal != 0 {
-			apDayPct = (ap.dayPL / openVal) * 100
-		}
 		if l := len(ap.symbol); l > pw0 {
 			pw0 = l
 		}
 		if l := len(ap.description); l > pw1 {
 			pw1 = l
 		}
-		if l := len(formatQty(ap.quantity)); l > pw2 {
+		if l := len(formatDollar(ap.currentPrice)); l > pw2 {
 			pw2 = l
 		}
-		if l := len(formatDollar(ap.marketValue)); l > pw3 {
+		if l := len(formatChangeDollar(ap.priceChange)); l > pw3 {
 			pw3 = l
 		}
-		if l := len(formatChangeDollar(ap.dayPL)); l > pw4 {
+		if l := len(formatChangePct(ap.priceChangePct)); l > pw4 {
 			pw4 = l
 		}
-		if l := len(formatChangePct(apDayPct)); l > pw5 {
+		if l := len(formatDollar(ap.marketValue)); l > pw5 {
 			pw5 = l
 		}
 	}
+	for _, q := range indices {
+		if l := len(q.Label); l > pw0 {
+			pw0 = l
+		}
+		if l := len(q.Description); l > pw1 {
+			pw1 = l
+		}
+		if l := len(formatDollar(q.Last)); l > pw2 {
+			pw2 = l
+		}
+		if l := len(formatChangeDollar(q.NetChange)); l > pw3 {
+			pw3 = l
+		}
+		if l := len(formatChangePct(q.NetChangePct)); l > pw4 {
+			pw4 = l
+		}
+	}
+
+	posSepLen := pw0 + 2 + pw1 + 2 + pw2 + 2 + pw3 + 2 + pw4 + 2 + pw5
 
 	// ── Helpers ────────────────────────────────────────────────────────────
 
 	sep := func() {
-		fmt.Println(strings.Repeat("-", sepLen))
+		fmt.Println(strings.Repeat("─", sepLen))
+	}
+
+	posSep := func() {
+		fmt.Println(strings.Repeat("─", posSepLen))
 	}
 
 	printAccountRow := func(account, liqVal, dayChange, dayPct string, positive, zero, bold bool) {
@@ -353,79 +480,86 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 	}
 
 	printAggPositionRow := func(ap *aggPosition) {
-		var dayPct float64
-		openVal := ap.marketValue - ap.dayPL
-		if openVal != 0 {
-			dayPct = (ap.dayPL / openVal) * 100
+		dimStart, dimEnd := "", ""
+		if isTTY && ap.stale {
+			dimStart = ansiDim
+			dimEnd = ansiReset
 		}
 		colorStart, colorEnd := "", ""
-		if isTTY && ap.dayPL != 0 {
-			if ap.dayPL > 0 {
+		if isTTY && ap.priceChange != 0 {
+			if ap.priceChange > 0 {
 				colorStart = ansiGreen
 			} else {
 				colorStart = ansiRed
 			}
-			colorEnd = ansiReset
+			if ap.stale {
+				colorEnd = ansiReset + ansiDim
+			} else {
+				colorEnd = ansiReset
+			}
 		}
-		dimStart, dimEnd := "", ""
-		if isTTY {
-			dimStart = ansiDim
-			dimEnd = ansiReset
-		}
-		fmt.Printf("%s%-*s  %-*s  %*s  %*s  %s%*s  %*s%s%s\n",
+		fmt.Printf("%s%-*s  %-*s  %*s  %s%*s  %*s%s  %*s%s\n",
 			dimStart,
 			pw0, ap.symbol,
 			pw1, ap.description,
-			pw2, formatQty(ap.quantity),
-			pw3, formatDollar(ap.marketValue),
+			pw2, formatDollar(ap.currentPrice),
 			colorStart,
-			pw4, formatChangeDollar(ap.dayPL),
-			pw5, formatChangePct(dayPct),
+			pw3, formatChangeDollar(ap.priceChange),
+			pw4, formatChangePct(ap.priceChangePct),
 			colorEnd,
+			pw5, formatDollar(ap.marketValue),
+			dimEnd,
+		)
+	}
+
+	regularOpen := mktHours.IsRegularMarketOpen()
+	printIndexRow := func(q api.IndexQuote) {
+		dimStart, dimEnd := "", ""
+		if isTTY && !regularOpen {
+			dimStart = ansiDim
+			dimEnd = ansiReset
+		}
+		colorStart, colorEnd := "", ""
+		if isTTY && q.NetChange != 0 {
+			if q.NetChange > 0 {
+				colorStart = ansiGreen
+			} else {
+				colorStart = ansiRed
+			}
+			// If dimming, reset+re-apply dim after the colored section so
+			// the remaining fields (mkt value) stay dim rather than plain.
+			if !regularOpen {
+				colorEnd = ansiReset + ansiDim
+			} else {
+				colorEnd = ansiReset
+			}
+		}
+		fmt.Printf("%s%-*s  %-*s  %*s  %s%*s  %*s%s  %*s%s\n",
+			dimStart,
+			pw0, q.Label,
+			pw1, q.Description,
+			pw2, formatDollar(q.Last),
+			colorStart,
+			pw3, formatChangeDollar(q.NetChange),
+			pw4, formatChangePct(q.NetChangePct),
+			colorEnd,
+			pw5, "",
 			dimEnd,
 		)
 	}
 
 	printPositionHeader := func() {
-		fmt.Printf("%s%-*s  %-*s  %*s  %*s  %*s  %*s%s\n",
-			ansiDim,
+		fmt.Printf("%-*s  %-*s  %*s  %*s  %*s  %*s\n",
 			pw0, hSymbol,
-			pw1, hDesc,
-			pw2, hQty,
-			pw3, hMktVal,
-			pw4, hPosDayChg,
-			pw5, hPosDayPct,
-			ansiReset,
+			pw1, hName,
+			pw2, hPrice,
+			pw3, hChgD,
+			pw4, hChgP,
+			pw5, hMktVal,
 		)
 	}
 
 	// ── Render ─────────────────────────────────────────────────────────────
-
-	// Index quotes line.
-	if len(indices) > 0 {
-		parts := make([]string, 0, len(indices))
-		for _, q := range indices {
-			chgColor, chgReset := "", ""
-			if isTTY && q.NetChange != 0 {
-				if q.NetChange > 0 {
-					chgColor = ansiGreen
-				} else {
-					chgColor = ansiRed
-				}
-				chgReset = ansiReset
-			}
-			parts = append(parts, fmt.Sprintf("%s: %s  %s%s  %s%s",
-				q.Label,
-				formatDollar(q.Last),
-				chgColor,
-				formatChangeDollar(q.NetChange),
-				formatChangePct(q.NetChangePct),
-				chgReset,
-			))
-		}
-		fmt.Println(strings.Join(parts, "    ") + "\033[K")
-		fmt.Println()
-	}
 
 	// Account section header.
 	fmt.Printf("%-*s    %*s    %*s    %*s\n",
@@ -444,14 +578,28 @@ func printTable(accounts []api.Account, accountEntries map[string]config.Account
 	printAccountRow("TOTAL", totalLiqStr, totalChgStr, totalPctStr,
 		totalChangeDollar > 0, totalChangeDollar == 0, true)
 
-	// ── Aggregated positions section ────────────────────────────────────────
-	if len(aggSymbols) > 0 {
+	// ── Aggregated positions section (indices at top, then holdings) ────────
+	if len(indices) > 0 || len(aggSymbols) > 0 {
 		fmt.Println()
 		printPositionHeader()
+		posSep()
+		for _, q := range indices {
+			printIndexRow(q)
+		}
+		if len(indices) > 0 && len(aggSymbols) > 0 {
+			posSep()
+		}
 		for _, sym := range aggSymbols {
 			printAggPositionRow(aggMap[sym])
 		}
+		posSep()
 	}
+}
+
+// visLen returns the number of terminal columns s occupies.
+// ∆ (U+2206) is 3 UTF-8 bytes but renders as 1 column, so we subtract 2 per occurrence.
+func visLen(s string) int {
+	return len(s) - 2*strings.Count(s, "∆")
 }
 
 // maskAccount returns the last 3 digits of an account number (no prefix),

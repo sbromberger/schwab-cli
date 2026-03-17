@@ -28,9 +28,10 @@ type Balances struct {
 
 // Instrument describes the security held in a position.
 type Instrument struct {
-	Symbol      string `json:"symbol"`
-	Description string `json:"description"`
-	AssetType   string `json:"assetType"`
+	Symbol      string  `json:"symbol"`
+	Description string  `json:"description"`
+	AssetType   string  `json:"assetType"`
+	NetChange   float64 `json:"netChange"` // daily price change per share (absent for unpriced funds)
 }
 
 // Position is a single holding within an account.
